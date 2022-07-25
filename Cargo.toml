@@ -3,4 +3,5 @@ members = [
     "intro",
     "scrap",
     "chat_server",
+    "chat_client",
 ]
