@@ -2,4 +2,5 @@
 members = [
     "intro",
     "scrap",
+    "chat_server",
 ]
