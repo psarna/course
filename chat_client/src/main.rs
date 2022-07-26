@@ -8,30 +8,32 @@ use std::error::Error;
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 struct ChatClient {
-    reader: BufReader<OwnedReadHalf>,
     writer: BufWriter<OwnedWriteHalf>,
 }
 
 impl ChatClient {
-    async fn connect(addr: &str) -> Result<Self> {
+    async fn connect(addr: &str) -> Result<(Self, BufReader<OwnedReadHalf>)> {
         let (read_half, write_half) = TcpStream::connect(addr).await?.into_split();
-        Ok(Self {
-            reader: BufReader::new(read_half),
-            writer: BufWriter::new(write_half),
-        })
+        Ok((
+            Self {
+                writer: BufWriter::new(write_half),
+            },
+            BufReader::new(read_half),
+        ))
     }
 
     async fn register(&mut self, username: &str) -> Result<()> {
         self.writer.write_all(b"login ").await?;
         self.writer.write_all(username.as_bytes()).await?;
         self.writer.write_all(b"\n").await?;
+        self.writer.flush().await?;
+        println!("Registered successfully as {}", username);
         Ok(())
     }
 
-    async fn receive(&mut self) -> Result<String> {
+    async fn receive(reader: &mut BufReader<OwnedReadHalf>) -> Result<String> {
         let mut line = String::new();
-        let n = self
-            .reader
+        reader
             .read_line(&mut line)
             .await
             .expect("failed to read data from socket");
@@ -43,6 +45,7 @@ impl ChatClient {
         self.writer.write_all(recipient.as_bytes()).await?;
         self.writer.write_all(b" ").await?;
         self.writer.write_all(msg.as_bytes()).await?;
+        self.writer.flush().await?;
         Ok(())
     }
 }
@@ -54,6 +57,7 @@ async fn accept_message() -> Result<(String, String)> {
     let mut stdin = BufReader::new(tokio::io::stdin());
     println!("Enter recipient:");
     stdin.read_line(&mut recipient).await?;
+    recipient.pop(); // get rid of the trailing newline character
     println!("Enter message:");
     stdin.read_line(&mut message).await?;
     Ok((recipient, message))
@@ -65,78 +69,32 @@ async fn main() -> Result<()> {
     args.next();
     let addr = args.next().unwrap_or_else(|| "localhost:8123".to_string());
 
-    let mut client = ChatClient::connect(&addr).await?;
+    let (mut client, mut reader) = ChatClient::connect(&addr).await?;
     println!("Please type in your username:");
     let mut username = String::new();
     std::io::stdin().read_line(&mut username)?;
+    username.pop(); // get rid of the trailing newline character
     client.register(&username).await?;
 
-    /*loop {
-        tokio::select! {
-            command
+    // A task for receiving and printing messages from other clients
+    tokio::spawn(async move {
+        loop {
+            let incoming_msg = ChatClient::receive(&mut reader)
+                .await
+                .expect("Receiving message failed");
+            println!("> {}", incoming_msg)
         }
-    }*/
+    });
 
-    /*loop {
-        tokio::select! {
-            accept_result = listener.accept() => {
-                let (raw_socket, peer) = accept_result?;
-                println!("Accepted a connection from {}", peer);
-                let (read_half, write_half) = raw_socket.into_split();
-                let mut read_half = tokio::io::BufReader::new(read_half);
-
-                let chat = global_chat.clone();
-                tokio::spawn(async move {
-                    let mut user: Option<String>;
-                    loop {
-                        let mut line = String::new();
-                        let n = read_half.read_line(&mut line).await.expect("failed to read data from socket");
-                        if n == 0 {
-                            println!("{} disconnected", peer);
-                            return
-                        }
-                        let line = strip_newline(&line);
-                        let mut chat_locked = chat.lock().await;
-                        user = chat_locked.handle_login(line).await;
-                        match user {
-                            Some(ref name) => {
-                                chat_locked.register(&name, write_half).await;
-                                break
-                            },
-                            None => (),
-                        }
-                    }
-                    let user = user.unwrap();
-                    loop {
-                        let mut line = String::new();
-                        let n = read_half
-                            .read_line(&mut line)
-                            .await
-                            .expect("failed to read data from socket");
-                        if n == 0 {
-                            println!("{} disconnected", peer);
-                            return
-                        }
-                        let line = strip_newline(&line);
-
-                        let mut chat_locked = chat.lock().await;
-                        chat_locked.handle_message(&user, line).await;
-                    }
-                });
-            },
-            msg = receiver.recv() => {
-                let msg = msg.unwrap();
-                let mut chat_locked = global_chat.lock().await;
-                match chat_locked.peers_by_name.get_mut(&msg.recipient) {
-                    Some(write_half) => {
-                        write_half.write_all(msg.body.as_bytes()).await.expect("failed to write response into socket");
-                    },
-                    None => {
-                        println!("Nonexistent recipient: {}", msg.recipient);
-                    }
-                }
-            }
-        }
-    }*/
-    Ok(())
+    // A task for reading a message request from standard input (usually just keyboard),
+    // and sending it to other clients
+    loop {
+        let (recipient, msg) = accept_message()
+            .await
+            .expect("Accepting a message command from stdin failed");
+        client
+            .send(&recipient, &msg)
+            .await
+            .expect("Sending a message failed");
+    }
 }
